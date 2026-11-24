@@ -90,6 +90,13 @@ enum CS_BITS {
     PSRMUX,
     DRMUX1, DRMUX0,
     SR1MUX1, SR1MUX0,
+    LD_VA,
+    GATE_PTE,
+    GATE_PA,
+    MDRMUX1, MDRMUX0,
+    LD_RET,
+    RET_EN,
+    ST,
     CONTROL_STORE_BITS
 } CS_BITS;
 
@@ -133,6 +140,13 @@ int GetLD_SSP(int *x)        { return(x[LD_SSP]); }
 int GetLD_PRIV(int *x)       { return(x[LD_PRIV]); }
 int GetPSRMUX(int *x)        { return(x[PSRMUX]); }
 /* MODIFY: you can add more Get functions for your new control signals */
+int GetLD_VA(int *x)         { return(x[LD_VA]); }
+int GetGATE_PTE(int *x)      { return(x[GATE_PTE]); }
+int GetGATE_PA(int *x)       { return(x[GATE_PA]); }
+int GetMDRMUX(int *x)        { return((x[MDRMUX1] << 1) + x[MDRMUX0]); }
+int GetLD_RET(int *x)        { return(x[LD_RET]); }
+int GetRET_EN(int *x)        { return(x[RET_EN]); }
+int GetST(int *x)            { return(x[ST]); }
 
 /***************************************************************/
 /* The control store rom.                                      */
@@ -197,6 +211,8 @@ int SSP; /* Initial value of system stack pointer */
 int PTBR; /* This is initialized when we load the page table */
 int VA;   /* Temporary VA register */
 /* MODIFY: you should add here any other registers you need to implement virtual memory */
+int RET;  /* Return state after translation */
+int WR;   /* 1 if the pending access is a write */
 
 } System_Latches;
 
@@ -246,6 +262,10 @@ void cycle() {
   eval_bus_drivers();
   drive_bus();
   latch_datapath_values();
+
+  if (CYCLE_COUNT == 299){
+    NEXT_LATCHES.INTV = 0x01;
+  }
 
   CURRENT_LATCHES = NEXT_LATCHES;
 
@@ -594,6 +614,9 @@ void initialize(char *argv[], int num_prog_files) {
     CURRENT_LATCHES.PRIV = 1;     /* start in user mode */
     CURRENT_LATCHES.INTV = 0;
     CURRENT_LATCHES.EXCV = 0;
+    CURRENT_LATCHES.VA = 0;
+    CURRENT_LATCHES.RET = 0;
+    CURRENT_LATCHES.WR = 0;
 
     NEXT_LATCHES = CURRENT_LATCHES;
 
@@ -675,32 +698,46 @@ void eval_micro_sequencer() {
     int mar  = CURRENT_LATCHES.MAR;
     int ir = CURRENT_LATCHES.IR;
     int psr15     = ((cond == 4) && CURRENT_LATCHES.PRIV) << 3;
+    int mdr  = CURRENT_LATCHES.MDR;
 
-    // LOGIC1 
+    // LOGIC1
     int unal = GetDATA_SIZE(CURRENT_LATCHES.MICROINSTRUCTION) & (mar & 1);
-    int prot = CURRENT_LATCHES.PRIV && (Low16bits(mar) < 0x3000);
-    int exc  = prot | unal;
+    int prot = CURRENT_LATCHES.PRIV && !((mdr >> 3) & 1) && (CURRENT_LATCHES.RET != 28); /* PTE P bit, TRAP exempt */
+    int pf   = !((mdr >> 2) & 1);                                                         /* PTE V bit */
+    int exc  = (cond & 1) ? (prot | pf) : unal;
     int unk  = ird && ((ir >> 15) & 1) && !((ir >> 14) & 1) && ((ir >> 13) & 1);
     int intr = (CURRENT_LATCHES.INTV != 0);
 
+    int int_taken = (cond == 5) && intr;
+    int exc_taken = ((cond == 6) || (cond == 7)) && exc;
+
     if(GetIRD(CURRENT_LATCHES.MICROINSTRUCTION)){
         NEXT_LATCHES.STATE_NUMBER = 0x0F & (CURRENT_LATCHES.IR >> 12);
-    } 
+    }
+    else if(GetRET_EN(CURRENT_LATCHES.MICROINSTRUCTION)){
+        NEXT_LATCHES.STATE_NUMBER = CURRENT_LATCHES.RET;          /* return from translation */
+    }
+    else if(GetLD_RET(CURRENT_LATCHES.MICROINSTRUCTION) && !int_taken && !exc_taken){
+        NEXT_LATCHES.STATE_NUMBER = 50;                           /* start translation */
+    }
+    else if(exc_taken){
+        NEXT_LATCHES.STATE_NUMBER = 63;                           /* EXC_TAKEN forces all J bits */
+    }
     else{
-        int interrupt = ((cond == 5) && intr) << 4;
-        int exception = ((cond == 6) && exc) << 5;
+        int interrupt = int_taken << 4;
 
-        NEXT_LATCHES.STATE_NUMBER = J | branch | ready | addrMode | psr15 | interrupt | exception;
+        NEXT_LATCHES.STATE_NUMBER = J | branch | ready | addrMode | psr15 | interrupt;
     }
 
     /* LD.EXCV / ExcMux / CLR.INTV */
-    int ld_excv = ((cond == 5) && intr) || ((cond == 6) && exc) || unk;
+    int ld_excv = int_taken || exc_taken || unk;
     if(ld_excv){
-        if(unk)                NEXT_LATCHES.EXCV = 0x04;
-        else if(cond == 6)     NEXT_LATCHES.EXCV = prot ? 0x02 : 0x03; /* protection beats unaligned */
+        if(unk)                NEXT_LATCHES.EXCV = 0x05;
+        else if(cond == 6)     NEXT_LATCHES.EXCV = 0x03;                 /* unaligned */
+        else if(cond == 7)     NEXT_LATCHES.EXCV = prot ? 0x04 : 0x02;   /* protection beats page fault */
         else                   NEXT_LATCHES.EXCV = CURRENT_LATCHES.INTV;
     }
-    if((cond == 5) && intr){
+    if(int_taken){
         NEXT_LATCHES.INTV = 0; /* CLR.INTV */
     }
 
@@ -754,6 +791,7 @@ void cycle_memory() {
 
 int GATE_PC_VAL, GATE_MDR_VAL, GATE_ALU_VAL, GATE_SHF_VAL, GATE_MARMUX_VAL, addr_val;
 int GATE_PSR_VAL, GATE_SP_VAL, GATE_VECTOR_VAL;
+int GATE_PTE_VAL, GATE_PA_VAL, SETRM_VAL;
 
 // SR1MUX: 0 = IR[11:9], 1 = IR[8:6], 2/3 = R6 
 int sr1_reg(int *mi){
@@ -883,6 +921,15 @@ void eval_bus_drivers() {
     // gate_vector: x0200 + (EXCV << 1)
     GATE_VECTOR_VAL = 0x0200 | ((CURRENT_LATCHES.EXCV & 0xFF) << 1);
 
+    // gate_pte: PTBR[15:8], MAR[15:9] << 1
+    GATE_PTE_VAL = Low16bits((CURRENT_LATCHES.PTBR & 0xFF00) | (((CURRENT_LATCHES.MAR >> 9) & 0x7F) << 1));
+
+    // gate_pa: 00, PFN (MDR[13:9]), VA[8:0]
+    GATE_PA_VAL = Low16bits((CURRENT_LATCHES.MDR & 0x3E00) | (CURRENT_LATCHES.VA & 0x1FF));
+
+    // SetRM: MDR[0] <- 1, MDR[1] <- MDR[1] | WR
+    SETRM_VAL = Low16bits(CURRENT_LATCHES.MDR | 0x1 | (CURRENT_LATCHES.WR << 1));
+
 }
 
 
@@ -901,6 +948,8 @@ void drive_bus() {
     int gatepsr = GetGATE_PSR(CURRENT_LATCHES.MICROINSTRUCTION);
     int gatesp = GetGATE_SP(CURRENT_LATCHES.MICROINSTRUCTION);
     int gatevector = GetGATE_VECTOR(CURRENT_LATCHES.MICROINSTRUCTION);
+    int gatepte = GetGATE_PTE(CURRENT_LATCHES.MICROINSTRUCTION);
+    int gatepa = GetGATE_PA(CURRENT_LATCHES.MICROINSTRUCTION);
 
     if(gatepc){
         BUS = GATE_PC_VAL;
@@ -918,6 +967,10 @@ void drive_bus() {
         BUS = GATE_SP_VAL;
     }else if(gatevector){
         BUS = GATE_VECTOR_VAL;
+    }else if(gatepte){
+        BUS = GATE_PTE_VAL;
+    }else if(gatepa){
+        BUS = GATE_PA_VAL;
     }else{
         BUS = 0;
     }
@@ -943,18 +996,20 @@ void latch_datapath_values() {
     // ld.mdr
     int ldmdr =  GetLD_MDR(CURRENT_LATCHES.MICROINSTRUCTION);
     if(ldmdr){
-        int mioen = GetMIO_EN(CURRENT_LATCHES.MICROINSTRUCTION);
-        if(mioen){
+        int mdrmux = GetMDRMUX(CURRENT_LATCHES.MICROINSTRUCTION);
+        if(mdrmux == 0){ // memory
             if((CURRENT_LATCHES.READY)){
                 NEXT_LATCHES.MDR = Low16bits((MEMORY[(CURRENT_LATCHES.MAR >> 1)][0] & 0XFF) | ((MEMORY[(CURRENT_LATCHES.MAR >> 1)][1] & 0XFF) << 8));
             }
-        }else{
+        }else if(mdrmux == 1){ // bus
             int datasize = GetDATA_SIZE(CURRENT_LATCHES.MICROINSTRUCTION);
             if(datasize){
                 NEXT_LATCHES.MDR = BUS;
             }else{
                 NEXT_LATCHES.MDR = (BUS & 0xFF) | ((BUS & 0xFF) << 8);
             }
+        }else{ // SetRM
+            NEXT_LATCHES.MDR = SETRM_VAL;
         }
     }
 
@@ -1022,6 +1077,17 @@ void latch_datapath_values() {
     }
     if(GetLD_SSP(CURRENT_LATCHES.MICROINSTRUCTION)){
         NEXT_LATCHES.SSP = Low16bits(CURRENT_LATCHES.REGS[sr1_reg(CURRENT_LATCHES.MICROINSTRUCTION)]);
+    }
+
+    // ld.va: loaded straight from MAR
+    if(GetLD_VA(CURRENT_LATCHES.MICROINSTRUCTION)){
+        NEXT_LATCHES.VA = Low16bits(CURRENT_LATCHES.MAR);
+    }
+
+    // ld.ret: RET <- J (return state), WR <- ST
+    if(GetLD_RET(CURRENT_LATCHES.MICROINSTRUCTION)){
+        NEXT_LATCHES.RET = GetJ(CURRENT_LATCHES.MICROINSTRUCTION);
+        NEXT_LATCHES.WR = GetST(CURRENT_LATCHES.MICROINSTRUCTION);
     }
 
 }
